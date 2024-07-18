@@ -7,7 +7,7 @@ from subprocess import PIPE, Popen
 
 class PyBird:
     # BIRD reply codes: https://github.com/CZ-NIC/bird/blob/6c11dbcf28faa145cfb7310310a2a261fd4dd1f2/doc/reply_codes
-    ignored_field_numbers = (0, 1, 13, 1008, 2002, 9001)
+    ignored_field_numbers = (0, 1, 13, 2002, 9001)
     error_fields = (13, 19, 8001, 8002, 8003, 9000, 9001, 9002)
     success_fields = (0, 3, 4, 18, 20)
 
