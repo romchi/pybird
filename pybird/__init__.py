@@ -19,8 +19,10 @@ class PyBird:
         config_file=None,
         bird_cmd=None,
     ):
-        """Basic pybird setup.
-        Required argument: socket_file: full path to the BIRD control socket."""
+        """
+        Basic pybird setup.
+        Required argument: socket_file: full path to the BIRD control socket.
+        """
         self.socket_file = socket_file
         self.hostname = hostname
         self.user = user
@@ -32,7 +34,13 @@ class PyBird:
 
         self.clean_input_re = re.compile(r"\W+")
         self.field_number_re = re.compile(r"^(\d+)[ -]")
-        self.routes_field_re = re.compile(r"(\d+) imported,.* (\d+) exported")
+        
+        self.routes_field_imported_re = re.compile(r"(\d+) imported")
+        self.routes_field_exported_re = re.compile(r"(\d+) exported")
+        self.routes_field_filtered_re = re.compile(r"(\d+) filtered")
+        self.routes_field_preferred_re = re.compile(r"(\d+) preferred")
+        
+        # self.routes_field_re = re.compile(r"(\d+) imported,.* (\d+) exported")
         self.log = logging.getLogger(__name__)
 
     def get_config(self):
@@ -183,8 +191,15 @@ class PyBird:
         if err:
             raise ValueError(err)
 
-    def get_routes(self, prefix=None, peer=None):
+    def get_routes(self, table=None, prefix=None, peer=None, full=False):
+        """
+        Get all routes, or optionally for a specific table, prefix or peer.
+        """
         query = "show route all"
+        if full:
+            query += f" all "
+        if table:
+            query += f" table {table}"
         if prefix:
             query += f" for {prefix}"
         if peer:
@@ -249,7 +264,7 @@ class PyBird:
             return data
         return self._parse_route_data(data)
 
-    def _parse_route_data(self, data):
+    def _parse_route_data(self, data, short=True):
         """Parse a blob like:
         0001 BIRD 1.3.3 ready.
         1007-2a02:898::/32      via 2001:7f8:1::a500:8954:1 on eth1 [PS2 12:46] * (100) [AS8283i]
@@ -264,86 +279,160 @@ class PyBird:
         """
         lines = data.splitlines()
         routes = []
-
-        route_summary = None
+        
+        bird2route = re.compile(r"([\sa-f0-9\.:\/]+)?(?:unicast|blackhole)\s+\[")
+        bird1route = re.compile(r"(?:[a-f0-9\.:\/]+)?(\s+)?(?:via\s([^\s]+)\s+on\s+|\s+dev\s+)([\w\s]+)\[")
 
         self.log.debug("PyBird: parse route data: lines=%d", len(lines))
-        line_counter = -1
-        while line_counter < len(lines) - 1:
-            line_counter += 1
-            line = lines[line_counter].strip()
-            self.log.debug("PyBird: parse route data: %s", line)
-            (field_number, line) = self._extract_field_number(line)
-
-            if field_number in self.ignored_field_numbers:
-                continue
-
-            if field_number == 1007:
-                try:
-                    route_summary = self._parse_route_summary(line)
-                except ValueError:
-                    # bird2 sends route summary on a new line
-                    line_counter += 1
-                    line = lines[line_counter].strip()
-                    route_summary = self._parse_route_summary(line)
-
-            route_detail = None
-
-            if field_number == 1012:
-                if not route_summary:
-                    # This is not detail of a BGP route
+        route_summary = dict()
+        prev_prefix = None
+        counter = -1
+        prev_number = 1007
+        for line in lines:
+            counter += 1
+            (number, line) = self._extract_field_number(line)
+            
+            if number is None:
+                number = prev_number
+            prev_number = number
+            
+            if number == 1007:
+                if len(route_summary) > 0:
+                    routes.append(route_summary)
+                    route_summary = {}
+                    
+                if line == "" or line.startswith("Table"):
                     continue
+                
+                if  bird2route.match(line):
+                   # print("bird 2: ", line, lines[counter+1])
+                   route_summary = self._parse_route_summary_bird2([line, lines[counter+1]])
 
-                # A route detail spans multiple lines, read them all
-                route_detail_raw = []
-                while "BGP." in line:
-                    route_detail_raw.append(line)
-                    line_counter += 1
-                    line = lines[line_counter]
-                    self.log.debug("PyBird: parse route data: %s", line)
-                # this loop will have walked a bit too far, correct it
-                line_counter -= 1
+                if bird1route.match(line):
+                   # print("bird 1: ", line)
+                   route_summary = self._parse_route_summary_bird1(line)
+                
+                if "prefix" in route_summary:
+                    if route_summary["prefix"] is None:
+                        route_summary["prefix"] = prev_prefix
+                    else:
+                        prev_prefix = route_summary["prefix"]
 
-                route_detail = self._parse_route_detail(route_detail_raw)
+            if number == 1008:
+                route_summary.update(self._parse_route_type(line))
 
-                # Save the summary+detail info in our result
-                route_detail.update(route_summary)
-                # Do not use this summary again on the next run
-                route_summary = None
-                routes.append(route_detail)
+            if number == 0:
+                routes.append(route_summary)
+                
+            if not short:
+                if number == 1012:
+                    if not route_summary:
+                        continue
+                    
+                    data = self._parse_route_detail(line)
+                    if data["proto"] in route_summary:
+                        route_summary[data["proto"]][data["atribute"]] = data["value"]
+                    else:
+                        route_summary[data["proto"]] = {}
+                        route_summary[data["proto"]][data["atribute"]] = data["value"]
 
-            if field_number == 8001:
+            if number == 8001:
                 # network not in table
                 return []
 
         return routes
 
-    def _re_route_summary(self):
-        return re.compile(
-            r"(?P<prefix>[a-f0-9\.:\/]+)?\s+"
-            r"((?:via\s+(?P<peer>[^\s]+) on |dev )(?P<interface>[^\s]+)|(?:\w+)?)?\s*"
-            r"\[(?P<source>[^\s]+) (?P<time>[^\]\s]+)(?: from (?P<peer2>[^\s]+))?\]"
-        )
-
-    def _parse_route_summary(self, line):
+    def _parse_route_summary_bird1(self, line):
         """Parse a line like:
         2a02:898::/32      via 2001:7f8:1::a500:8954:1 on eth1 [PS2 12:46] * (100) [AS8283i]
+        1007-10.0.0.0/24          unicast [rs1_ipv4 10:03:04.485] * (100) [AS65010i]
+                via 10.123.123.10 on eth0
+        1007-                     unicast [rs2_ipv4 10:03:04.436] (100) [AS65010i]
+                via 10.123.123.20 on eth0
         """
-        match = self._re_route_summary().match(line)
+        rs = re.compile(
+            r"(?P<prefix>[a-f0-9\.:\/]+)?(\s+)?((?:via\s+(?P<peer>[^\s]+)\s+on\s+|\s+dev\s+)(?P<interface>[^\s]+)|(?:\w+)?)?\s+"
+            r"\[(?P<source>[^\s]+)\s+(?P<time>[^\]\s]+)(?:\s+from\s+(?P<peer2>[^\s]+))?\]\s+"
+            r"(?:(?P<best>[*,!])\s+)?(?:\((?P<preference>[\w\/\-\?]+)\))?(?:\s+\[AS(?P<asn>\d+)[\w\?]\])?"
+        )
+        match = rs.match(line)
         if not match:
-            raise ValueError(f"couldn't parse line '{line}'")
-        # Note that split acts on sections of whitespace - not just single
-        # chars
+            raise ValueError(f"couldn't parse bird1 line '{line}'")
+        # Note that split acts on sections of whitespace - not just single chars
         route = match.groupdict()
+        # print(route)
 
         # python regex doesn't allow group name reuse
         if not route["peer"]:
             route["peer"] = route.pop("peer2")
         else:
             del route["peer2"]
+        
+        if route["best"] is not None:
+            route["best"] = True
+        else:
+            route["best"] = False
+        
         return route
 
-    def _parse_route_detail(self, lines):
+    def _parse_route_summary_bird2(self, line):
+        """Parse a line like:
+        1007-10.0.0.0/24          unicast [rs1_ipv4 10:03:04.485] * (100) [AS65010i]
+                via 10.123.123.10 on eth0
+        1007-                     unicast [rs2_ipv4 10:03:04.436] (100) [AS65010i]
+                via 10.123.123.20 on eth0
+        """
+        rs0 = re.compile(
+            r"(\s)?(?P<prefix>[a-f0-9\.:\/]+)?(\s+)?(?:unicast|blackhole)\s+"
+            r"\[(?P<source>[^\s]+)\s+(?P<time>[^\]\s]+)(?:\s+from\s+(?P<peer2>[^\s]+))?\]"
+            r"\s+(?:(?P<best>[*,!])\s+)?(?:\((?P<preference>[\w\/\-\?]+)\))?(?:\s+\[AS(?P<asn>\d+)[\w\?]\])?"
+        )
+        rs1 = re.compile(r"(?:^\s+via\s+(?P<peer>[a-f0-9\.:\/]+)\s+on\s+|^\s+dev\s+)(?P<interface>[\w]+)")
+        
+        if len(line) < 2:
+            raise ValueError(f"bird2 should have route in 2 lines")
+        match0 = rs0.match(line[0])
+        match1 = rs1.match(line[1])
+        if not match0:
+            raise ValueError(f"couldn't parse bird2 line '{line[0]}'")
+        if not match1:
+            raise ValueError(f"couldn't parse bird2 line '{line[1]}'")
+        # Note that split acts on sections of whitespace - not just single chars
+        route = match0.groupdict()
+        route.update(match1.groupdict())
+        
+        # print(route)
+
+        # python regex doesn't allow group name reuse
+        if not route["peer"]:
+            route["peer"] = route.pop("peer2")
+        else:
+            del route["peer2"]
+        
+        if route["best"] is not None:
+            route["best"] = True
+        else:
+            route["best"] = False
+        
+        return route
+
+    def _parse_route_type(self, line):
+        """
+        Parse a line like:
+        1008-	Type: BGP unicast univ
+        1008-	Type: device unicast univ
+        """
+        # match = re.match(r".+Type:\s+(?P<type>\w+)\s+(?P<scope>\w+)\s+(?P<family>\w+)", line)
+        rs = re.compile(r"Type:\s+(?P<type>[\w\s]+)")
+        match = rs.match(line)
+        if not match:
+            raise ValueError(f"couldn't parse Type line '{line}'")
+
+        route_type = match.groupdict()
+
+        return route_type
+
+    def _parse_route_detail(self, line):
         """Parse a blob like:
         1012-   BGP.origin: IGP
             BGP.as_path: 8954 8283
@@ -351,28 +440,23 @@ class PyBird:
             BGP.local_pref: 100
             BGP.community: (8954,620)
         """
-        attributes = {}
+        rs = re.compile(
+            r"^(?:(?P<proto>[\w]+))\.(?:(?P<atribute>[\w]+))(?:\:[\s]+(?P<value>[\s\w\W]+)?)"
+        )
+        #print(line)
+        match = rs.match(line)
+        result = match.groupdict()
 
-        for line in lines:
-            line = line.strip()
-            self.log.debug("PyBird: parse route details: %s", line)
-            # remove 'BGP.'
-            line = line[4:]
-            parts = line.split(": ")
-            if len(parts) == 2:
-                (key, value) = parts
-            else:
-                # handle [BGP.atomic_aggr:]
-                key = parts[0].strip(":")
-                value = True
+        if result["atribute"] == "community":
+            # convert (8954,220) (8954,620) to 8954:220 8954:620
+            value = result["value"].replace(",", ":").replace("(", "").replace(")", "")
+            result["value"] = value
+        if result["atribute"] == "ext_community":
+            # convert (rt, 1, 199524) to rt:1:199524
+            value = result["value"].replace(", ", ":").replace("(", "").replace(")", "")
+            result["value"] = value
 
-            if key == "community":
-                # convert (8954,220) (8954,620) to 8954:220 8954:620
-                value = value.replace(",", ":").replace("(", "").replace(")", "")
-
-            attributes[key] = value
-
-        return attributes
+        return result
 
     def get_peer_status(self, peer_name=None):
         """Get the status of all peers or a specific peer.
@@ -538,6 +622,12 @@ class PyBird:
             "neighbor address": "address",
             "neighbor as": "asn",
             "source address": "source",
+            "preference": "preference",
+            "input filter": "input_filter",
+            "output filter": "output_filter",
+            "route limit": "route_limit",
+            "hold timer": "hold_timer",
+            "keepalive timer": "keepalive_timer"
         }
         lineiterator = iter(peer_detail_raw)
 
@@ -550,10 +640,32 @@ class PyBird:
                 continue
             value = value.strip()
 
+            # if field.lower() == "routes":
+            #     routes = self.routes_field_re.findall(value)[0]
+            #     result["routes_imported"] = int(routes[0])
+            #     result["routes_exported"] = int(routes[1])
+
             if field.lower() == "routes":
-                routes = self.routes_field_re.findall(value)[0]
-                result["routes_imported"] = int(routes[0])
-                result["routes_exported"] = int(routes[1])
+                result["routes_imported"] = (
+                    int(self.routes_field_imported_re.findall(value)[0])
+                    if len(self.routes_field_imported_re.findall(value)) > 0
+                    else 0
+                )
+                result["routes_exported"] = (
+                    int(self.routes_field_exported_re.findall(value)[0])
+                    if len(self.routes_field_exported_re.findall(value)) > 0
+                    else 0
+                )
+                result["routes_filtered"] = (
+                    int(self.routes_field_filtered_re.findall(value)[0])
+                    if len(self.routes_field_filtered_re.findall(value)) > 0
+                    else 0
+                )
+                result["routes_preferred"] = (
+                    int(self.routes_field_preferred_re.findall(value)[0])
+                    if len(self.routes_field_preferred_re.findall(value)) > 0
+                    else 0
+                )
 
             if field.lower() in route_change_fields:
                 (received, rejected, filtered, ignored, accepted) = value.split()
@@ -587,9 +699,9 @@ class PyBird:
         if len(matches):
             field_number = int(matches[0])
             cleaned_line = self.field_number_re.sub("", line).strip("-")
-            return (field_number, cleaned_line)
+            return (field_number, cleaned_line.strip())
         else:
-            return (None, line)
+            return (None, line.strip())
 
     def _calculate_datetime(self, value, now=None):
         """Turn the BIRD date format into a python datetime."""
@@ -611,13 +723,13 @@ class PyBird:
                         value[17:19],
                     ),
                 )
-            )
+            ).strftime('%m/%d/%Y %H:%M:%S')
         except ValueError:
             pass
 
         # Case: YYYY-MM-DD
         try:
-            return datetime(*map(int, (value[:4], value[5:7], value[8:10])))
+            return datetime(*map(int, (value[:4], value[5:7], value[8:10]))).strftime('%m/%d/%Y %H:%M:%S')
         except ValueError:
             pass
 
@@ -639,7 +751,7 @@ class PyBird:
             ):
                 result_date = result_date - timedelta(days=1)
 
-            return result_date
+            return result_date.strftime('%m/%d/%Y %H:%M:%S')
         except ValueError:
             # It's a different format, keep on processing
             pass
@@ -663,14 +775,14 @@ class PyBird:
                 year = now.year - 1
 
             result_date = datetime(year, parsed.month, parsed.day)
-            return result_date
+            return result_date.strftime('%m/%d/%Y %H:%M:%S')
         except ValueError:
             pass
 
         # Case: plain year
         try:
             year = int(value)
-            return datetime(year, 1, 1)
+            return datetime(year, 1, 1).strftime('%m/%d/%Y %H:%M:%S')
         except ValueError:
             raise ValueError("Can not parse datetime: [%s]" % value)
 
